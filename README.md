@@ -91,7 +91,7 @@ Hook 只在麦麦本来就要回复时触发。
 `prompt.include_upcoming_days`：提前几天开始提醒，默认 0（只在当天）。填 1 时生日前一天也会注入「明天生日」。
 
 `prompt.prompt_template`：注入文本，占位符 `{names}` 寿星列表、`{count}` 人数、`{upcoming}` 未来几天即将过生日的人。
-想回到更保守的「合适才提」语气，换成 `config.example.toml` 里注释的那版。
+想回到更保守的「合适才提」语气，就换成：`【生日提醒】今天是 {names} 的生日。如果当前对话里自然合适，可以顺口祝一句生日快乐；如果不合适或在聊别的事，就正常聊，不要硬提。`
 
 `access.admin_user_ids`：允许执行写操作指令（`recheck` / `group` / `custom` / `del`）的 QQ 号。本机操作者始终允许，
 留空表示只有本机操作者能改数据。
@@ -151,7 +151,8 @@ admin_user_ids = ["10001"]
 不兼容，遇到这种情况提个 Issue 说明你的版本。
 
 从插件市场搜「麦麦祝你生日快乐呀」安装即可，也可以把文件夹放进 MaiBot 根目录的 plugins/ 后重启 MaiBot。
-config.toml 由宿主按配置模型自动生成，不需要手写；模板是仓库里的 config.example.toml。
+插件是单文件布局（`plugin.py` + `_manifest.json` + `README.md` + `LICENSE`），没有额外依赖；
+config.toml 由宿主按配置模型自动生成，字段说明和默认值都在里面，不需要手写。
 
 生日数据只有 NapCat 适配器能提供：SnowLuma 的资料接口走 OIDB `0xFE1_2`，属性目录里没有生日字段，
 所以换到 SnowLuma 适配器也采不到生日。同时启用两个适配器时记得把 `plugin.adapter_plugin_id` 填成全名。
@@ -171,8 +172,8 @@ QQ 名片里的生日是可选字段：对方没填、或隐私设置里不公�
 采到的生日只存在本地 birthdays.json，插件不会外发。文件写坏时不会清空数据，会先把坏文件改名成
 `birthdays.json.broken` 再按空库启动；道贺记录只保留最近 30 天，判定只看当天。
 
-仓库根目录的 `maibot-birthday-plugin-selfcheck.py` 是开发用自检脚本，用 MaiBot 自带的 venv 运行，
+工作目录里的 `maibot-birthday-plugin-selfcheck.py` 是开发用自检脚本，用 MaiBot 自带的 venv 运行，
 会用宿主的 `PluginManifest` 校验 manifest、按 Runner 的方式加载 plugin.py，再用假的上下文跑一遍
-Hook、指令、工具和道贺投递，最后比对 config.example.toml 与配置 Schema 是否一致。
+Hook、指令、工具和道贺投递，最后核对配置模型里每个字段是否都写了说明。
 
 许可 MIT，见 LICENSE。

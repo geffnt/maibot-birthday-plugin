@@ -1,0 +1,12 @@
+# 本地运行产物（插件中心要求仓库根目录只有发行需要的文件）
+__pycache__/
+*.py[cod]
+
+# 每个部署环境自己的配置（模板是 config.example.toml）
+config.toml
+config_back/
+data/
+
+# 插件更新器留下的备份
+.update_backups/
+.maibot-release.json

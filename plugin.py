@@ -576,7 +576,7 @@ _MD_PATTERN = re.compile(r"(\d{1,2})\s*[-/.月]\s*(\d{1,2})")
 def parse_month_day(value: str) -> tuple[int, int] | None:
     """从 ``"05-20"`` / ``"5月20日"`` / ``"5/20"`` 解析出 ``(月, 日)``；非法返回 ``None``。
 
-    同时用于手工登记指令（``/birth set 小明 05-20``）和名片字段的字符串兜底，
+    同时用于手工登记指令（``/birth custom 10001 05-20``）和名片字段的字符串兜底，
     保证两处口径一致。
     """
 
@@ -1634,7 +1634,7 @@ class BirthdayScheduler:
     ) -> str:
         """算出某个人的道贺文案：模板兜底 → （默认）交给模型生成。
 
-        发送与 ``/birth preview`` 共用这一条路径，保证"预览看到的"就是"会发出去的"。
+        发送与 ``/birth test`` 共用这一条路径，保证"测试看到的"就是"会发出去的"。
         """
 
         config = self._plugin.config.greeting
@@ -1702,6 +1702,31 @@ class BirthdayScheduler:
         if not dry_run and outcomes:
             self._store.save()
         return outcomes
+
+    async def send_test_message(
+        self, person: dict[str, Any], text: str, *, group_id: str = ""
+    ) -> bool:
+        """把一条测试祝福发到指定群或私聊，**不写"今天已道贺"**。
+
+        给 ``/birth test`` 用：走的是和真实道贺同一套投递函数（群走 ``send_group_msg``
+        带上 @ 段、私聊先走私聊流、不行再退回群临时会话），所以"测试通过"就等于
+        "当天能发出去"。群号为空时只看私聊通道；群里发起的测试由调用方指定 ``group_id``。
+        """
+
+        if group_id:
+            return await self._send_group(group_id, person, text)
+
+        # 私聊：先按 QQ 号找/开私聊流（好友、以及已经私聊过的人都走这条）
+        user_id = str(person.get("user_id") or "").strip()
+        if user_id:
+            stream_id = await self._resolve_stream(user_id=user_id)
+            if stream_id and await self._send_text(text, stream_id):
+                return True
+        # 开不出私聊流（不是好友）时，借共同群发一条群临时会话
+        target, borrow = self.temp_session_target(person)
+        if target:
+            return await self._send_temp_session(target, borrow, text)
+        return False
 
     # ---------- 目标解析 ----------
 
@@ -1970,6 +1995,8 @@ MAX_GROUP_PROBES = 8
 HELP_TEXT = """【麦麦祝你生日快乐呀】指令（也可以写成 /生日）
 /birth help                        这条帮助
 /birth list                        发送缓存里的全部生日
+/birth test                        在当前会话给我发一条测试祝福（不记入道贺）
+/birth test <QQ号> [群号]           给指定的人发测试祝福（群里发则 @ 他）
 —— 以下需要管理员 ——
 /birth recheck                     重新读取一次生日（好友 + 白名单群成员）
 /birth group <群号>                 把群号加进白名单，并打开群成员采集
@@ -2005,7 +2032,7 @@ def _split_message(text: str, chunk_chars: int = CHUNK_CHARS, max_chunks: int = 
         return [text]
     if sum(len(chunk) + 1 for chunk in chunks) < len(text):
         # 截断说明也要算进这一条的长度预算，否则最后一条会超出上限
-        note = "\n…（太长已截断，可用 /birth view <关键词> 缩小范围）"
+        note = "\n…（太长已截断，可用 /birth custom 修正个别记录，或 /birth del 删掉多余的）"
         while len(chunks[-1].splitlines()) > 1 and len(chunks[-1]) + len(note) > chunk_chars:
             chunks[-1] = "\n".join(chunks[-1].splitlines()[:-1])
         chunks[-1] += note
@@ -2229,7 +2256,7 @@ class BirthdayPlugin(MaiBotPlugin):
             return {
                 "content": (
                     f"没有找到和「{keyword}」相关的生日记录。"
-                    "如果这个人确实填了生日，可能需要先刷新缓存（/birth refresh）。"
+                    "如果这个人确实填了生日，可能需要先刷新缓存（/birth recheck）。"
                 )
             }
         today = date.today()
@@ -2240,7 +2267,7 @@ class BirthdayPlugin(MaiBotPlugin):
 
     @Command(
         "birthday",
-        description="群友生日：/birth help 看指令 / list 看缓存 / recheck 重新读取 / group 加群 / custom 手工登记 / del 删缓存",
+        description="群友生日：/birth help 看指令 / list 看缓存 / test 测试发送 / recheck 重新读取 / group 加群 / custom 手工登记 / del 删缓存",
         pattern=r"(?i)^/?(?:birth\b|生日)",
     )
     async def handle_birthday_command(self, **kwargs: Any) -> tuple[bool, str, bool]:
@@ -2297,11 +2324,16 @@ class BirthdayPlugin(MaiBotPlugin):
         sub = tokens[0].lower() if tokens else ""
         args = tokens[1:]
 
-        # 只保留这几个子命令：help / list / recheck / group / custom / del
+        # 只保留这几个子命令：help / list / test / recheck / group / custom / del
         if sub in ("", "help", "帮助", "?", "-h"):
             return True, HELP_TEXT, True
         if sub in ("list", "列表"):
             return True, self._list_summary(), True
+        if sub in ("test", "测试"):
+            # 不带参数只测自己：任何人可用；带了 QQ 号就是往别人那儿发，要管理员
+            if args and not self._is_admin(kwargs):
+                return True, "给指定 QQ 发测试祝福需要管理员权限（不带参数只测你自己）。", True
+            return True, await self._test_greeting(args, kwargs), True
 
         # ---- 以下需要管理员 ----
         if sub in ("recheck", "重新读取", "重读"):
@@ -2385,18 +2417,18 @@ class BirthdayPlugin(MaiBotPlugin):
             )
         if not self._store.people:
             lines.append(
-                "（本地还没有任何生日数据：可用 /birth refresh 采集，"
+                "（本地还没有任何生日数据：可用 /birth recheck 采集，"
                 "并确认 plugin.adapter_plugin_id 指向 NapCat 适配器）"
             )
         return "\n".join(lines)
 
     def _list_summary(self) -> str:
-        """列出缓存里的全部生日（``/birth view all``）。"""
+        """列出缓存里的全部生日（``/birth list``）。"""
 
         assert self._store is not None
         total = len(self._store.people)
         if not total:
-            return "缓存里还没有生日记录，先执行 /birth refresh 采集，或用 /birth set 手工登记。"
+            return "缓存里还没有生日记录，先执行 /birth recheck 采集，或用 /birth custom 手工登记。"
         today = date.today()
         lines = [f"共 {total} 人（缓存里的全部，按日期排序）："]
         lines.extend(
@@ -2404,6 +2436,58 @@ class BirthdayPlugin(MaiBotPlugin):
         )
         return "\n".join(lines)
 
+
+    async def _test_greeting(self, args: list[str], kwargs: dict[str, Any]) -> str:
+        """``/birth test [QQ号] [群号]``：当场发一条测试祝福，不记入"今天已道贺"。
+
+        不带参数就在当前会话测自己；群里发起时默认发到当前群（@ 目标），私聊发起时
+        走私聊通道。文案和真实道贺完全同一条生成路径，只有前缀多一个「【测试】」。
+        """
+
+        if self._scheduler is None or self._store is None:
+            return "生日插件还没准备好，请稍后再试。"
+
+        target = ""
+        group_id = ""
+        for token in args:
+            if not re.fullmatch(r"\d{4,12}", token):
+                return f"test 只认数字：{token} 既不是 QQ 号也不是群号。\n用法：/birth test [QQ号] [群号]"
+            if not target:
+                target = token
+            elif not group_id:
+                group_id = token
+            else:
+                return "用法：/birth test [QQ号] [群号]（最多两个数字）"
+
+        target = target or str(kwargs.get("user_id") or "").strip()
+        if not target:
+            return "没拿到你的 QQ 号，请写成 /birth test <QQ号> [群号]。"
+        group_id = group_id or str(kwargs.get("group_id") or "").strip()
+
+        # 缓存里有这个人就用真实记录（好友状态、所属群、年龄都照旧），没有就造一条最小的
+        person = dict(self._store.get_person(target) or {})
+        person["key"] = target
+        person["user_id"] = target
+        if not str(person.get("name") or "").strip():
+            person["name"] = target
+
+        text = "【测试】" + await self._scheduler.compose_greeting(person)
+        try:
+            sent = await self._scheduler.send_test_message(person, text, group_id=group_id)
+        except Exception as exc:
+            return f"测试祝福发送异常：{exc}"
+
+        where = f"群 {group_id}" if group_id else f"私聊 {target}"
+        if not sent:
+            hint = (
+                "群里发不出去，先看群号对不对、麦麦在不在那个群、适配器是否正常。"
+                if group_id
+                else "私聊发不出去：对方不是好友、没有可借的共同群，或那个群没允许发起临时会话。"
+            )
+            return f"测试祝福没有发出去（{where}）。\n{hint}"
+
+        self.ctx.logger.info("[测试] 已向 %s 发送测试祝福（%s）：%s", target, where, text)
+        return f"已发送到{where}（未记入道贺记录）：\n{text}"
 
     async def _recheck(self) -> str:
         """``/birth recheck``：立刻重新读取一次生日（好友 + 白名单群成员）。"""

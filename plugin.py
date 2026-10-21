@@ -66,13 +66,14 @@ CONFIG_SCHEMA_VERSION = "1.0.0"
 
 # 默认绑定的适配器插件 ID。
 #
-# 本插件读取的是 NapCat 名片里的 birthday_year / birthday_month / birthday_day。
-# SnowLuma 适配器的资料拉取走 OIDB 0xFE1_2，其属性键目录是
-# 102 签名 / 103 备注 / 105 等级 / 20002 昵称 / 20009 性别 / 20037 年龄 / 27394 QID，
-# 类型 ``UserProfileInfo`` 里也没有生日字段——所以数据只能从 NapCat 适配器取。
-#
+# 本插件读取的是名片里的 birthday_year / birthday_month / birthday_day 三个字段。
 # 同时启用 NapCat 与 SnowLuma 两个兼容适配器时，Host 按短名（``adapter.napcat.*``）
 # 解析会遇到多个提供方并直接拒绝调用；写成全名走 Host 的精确匹配分支。
+#
+# 但"配哪个"不该由用户操心：``call_adapter_api`` 会先试全名，遇到"找不到提供方"
+# 就退回短名（SnowLuma 也注册了 ``adapter.napcat.*`` 这组名字），并记住好用的那种。
+# 实测（2026-10-21，NapCat 未激活、SnowLuma 生效）：采集正常，
+# 好友 24 条命中 1 人、群 2 个、成员检查 36 人、失败 0 次。
 DEFAULT_ADAPTER_PLUGIN_ID = "maibot-team.napcat-adapter"
 
 ANNOUNCE_MODES: tuple[str, ...] = ("off", "prompt_only", "group", "private", "both")
@@ -129,10 +130,9 @@ class PluginSection(PluginConfigBase):
         default=DEFAULT_ADAPTER_PLUGIN_ID,
         description=(
             "提供 adapter.napcat.* API 的适配器插件 ID。"
-            "读取生日依赖 NapCat 特有的 birthday_year/month/day 字段，"
-            "SnowLuma 适配器没有这些字段；两个兼容适配器同时启用时短名不唯一、"
-            "Host 会拒绝调用，因此默认填 NapCat 适配器的全名。"
-            "全名找不到提供方时会自动退回短名（例如只装了 SnowLuma 之类兼容实现），"
+            "读取生日依赖名片里的 birthday_year/month/day 字段；"
+            "两个兼容适配器同时启用时短名不唯一、Host 会拒绝调用，因此默认填 NapCat 适配器的全名。"
+            "全名找不到提供方时会自动退回短名（例如实际生效的是 SnowLuma 之类兼容实现），"
             "并把好用的形态记到下次；留空则直接用短名"
         ),
         json_schema_extra={

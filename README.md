@@ -173,11 +173,12 @@ list_visible_to_all = true
 插件是单文件布局（`plugin.py` + `_manifest.json` + `README.md` + `LICENSE`），没有额外依赖；
 config.toml 由宿主按配置模型自动生成，字段说明和默认值都在里面，不需要手写。
 
-生日数据只有 NapCat 适配器能提供：SnowLuma 的资料接口走 OIDB `0xFE1_2`，属性目录里没有生日字段，
-所以换到 SnowLuma 适配器也采不到生日。同时启用两个适配器时记得把 `plugin.adapter_plugin_id` 填成全名。
+读生日靠的是名片里的 `birthday_year` / `birthday_month` / `birthday_day` 三个字段。NapCat 适配器直接给这三个字段；
+SnowLuma 这边资料取自它自己的 query service，同样注册了 `adapter.napcat.*` 这组名字
+（实测 2026-10-21：NapCat 未激活、SnowLuma 生效时采集正常，好友 24 条命中 1 人、群 2 个、失败 0 次），
+所以只装一个兼容适配器也不用改配置——全名找不到提供方会自动退回短名，并把好用的形态记住，日志里留一行「改用短名」。
 
-只装了一个兼容适配器（比如只有 SnowLuma，它同样注册了 `adapter.napcat.*` 这组名字）时不用改配置：
-全名找不到提供方会自动退回短名，并把好用的形态记住——日志里会留一行「改用短名」。
+同时启用两个适配器时短名不唯一、宿主会拒绝调用，这时把 `plugin.adapter_plugin_id` 填成全名即可。
 
 QQ 名片里的生日是可选字段：对方没填、或隐私设置里不公开，接口就返回空，插件一律当作没有数据，不会瞎猜，也不会因此删掉已有记录。
 拿不到是正常现象，不是插件坏了；名片上没写的人可以用 `/birth custom` 手工登记。

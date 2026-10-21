@@ -29,6 +29,7 @@ from typing import Any, Literal
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator, model_validator
 import re
+import tomllib
 from datetime import date
 from typing import Any, Iterable
 import json
@@ -543,10 +544,19 @@ class AccessSection(PluginConfigBase):
     admin_user_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "允许执行写操作指令（recheck / group / custom / del）的 QQ 号。"
+            "允许执行写操作指令（recheck / group / custom / del / test 指定对象）的 QQ 号。"
             "本机操作者（is_local_operator）始终允许。留空表示只有本机操作者能改数据"
         ),
         json_schema_extra={"label": "管理员 QQ", "hint": "留空 = 只有本机操作者能改数据"},
+    )
+
+    list_visible_to_all: bool = Field(
+        default=True,
+        description=(
+            "/birth list 对所有人开放吗。开着时群里谁都能看到全部生日缓存"
+            "（昵称 + QQ 号 + 月日）；介意的话关掉，只有管理员能看全量列表"
+        ),
+        json_schema_extra={"label": "列表对所有人可见", "hint": "关掉后只有管理员能看全量列表"},
     )
 
     @field_validator("admin_user_ids", mode="before")
@@ -1989,6 +1999,12 @@ class BirthdayScheduler:
 
 STORE_FILENAME = "birthdays.json"
 
+# 改 config.toml 用的哨兵与正则：_INVALID 表示"这串文本不是合法 TOML 值"，
+# _MISSING 表示"section 里根本没有这个键"（用 None 表示"键存在但值是 null"会混淆）。
+_INVALID = object()
+_MISSING = object()
+_SECTION_HEADER_RE = re.compile(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$")
+
 # 手工登记时最多探这么多个白名单群（每个群一次成员列表调用），防止一个指令打出去几十次请求
 MAX_GROUP_PROBES = 8
 
@@ -2268,7 +2284,9 @@ class BirthdayPlugin(MaiBotPlugin):
     @Command(
         "birthday",
         description="群友生日：/birth help 看指令 / list 看缓存 / test 测试发送 / recheck 重新读取 / group 加群 / custom 手工登记 / del 删缓存",
-        pattern=r"(?i)^/?(?:birth\b|生日)",
+        # 命令名后面必须跟分隔符或到结尾：否则群里一句「生日快乐」也会被当成指令，
+        # 回一屏帮助出去。分隔符除了空白，也放行中文里常用的引子（：，,）。
+        pattern=r"(?i)^/?(?:birth|生日)(?:\s|$|[：:，,])",
     )
     async def handle_birthday_command(self, **kwargs: Any) -> tuple[bool, str, bool]:
         """``/birth`` 指令入口：算回复 → 自己发送 → 把文本交回给日志。
@@ -2328,6 +2346,9 @@ class BirthdayPlugin(MaiBotPlugin):
         if sub in ("", "help", "帮助", "?", "-h"):
             return True, HELP_TEXT, True
         if sub in ("list", "列表"):
+            # 全量列表里有昵称 + QQ 号 + 月日，默认公开，但允许关掉只给管理员看
+            if not self.config.access.list_visible_to_all and not self._is_admin(kwargs):
+                return True, "查看完整生日列表需要管理员权限（access.list_visible_to_all 关着）。", True
             return True, self._list_summary(), True
         if sub in ("test", "测试"):
             # 不带参数只测自己：任何人可用；带了 QQ 号就是往别人那儿发，要管理员
@@ -2733,18 +2754,46 @@ class BirthdayPlugin(MaiBotPlugin):
     def _write_config_values(self, updates: dict[str, tuple[str, str]]) -> tuple[bool, str]:
         """把配置项写回 ``config.toml``，返回 ``(是否成功, 路径或失败原因)``。
 
-        Host 只有 ``config.get*`` 三个只读能力、没有"写配置"，所以想持久化只能改文件。
-        做法：只替换目标键那一行（没有这个键就插到对应 section 下），其余内容原样保留；
-        先写临时文件再 ``os.replace`` 原子替换，避免 Host 正好读到半个文件。
+        Host 只有 ``config.get*`` 几个只读能力、没有"写配置"，所以想持久化只能改文件。
+        这里对文件做定点替换，但**改之前必须解析得开、改之后必须还能解析**：用 ``tomllib``
+        校验一遍（包括"目标键确实变成了期望的值"），任一环节不成立就原样放弃——
+        宁可不写，也不给 Runner 留一个解不开的 config.toml。落盘仍是临时文件 + ``os.replace``。
         """
 
         path = self._config_path()
         if not path.is_file():
             return False, f"没找到配置文件 {path}"
         try:
-            text = path.read_text(encoding="utf-8")
-            for key, (value, section) in updates.items():
-                text = self._set_toml_value(text, key, value, section)
+            original = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+        try:
+            tomllib.loads(original)
+        except Exception as exc:
+            # 现有文件本身就坏着（手改过、或写了非法 TOML）：这时任何替换都只会更糟
+            return False, f"现有 config.toml 解析不了（{exc}），请先用 WebUI 修好再试"
+
+        expected: dict[str, Any] = {}
+        text = original
+        for key, (value, section) in updates.items():
+            parsed_value = self._toml_literal(value)
+            if parsed_value is _INVALID:
+                return False, f"内部错误：{key} 的值不是合法 TOML（{value}）"
+            expected[f"{section}.{key}"] = parsed_value
+            text = self._patch_toml(text, key, value, section)
+
+        try:
+            parsed = tomllib.loads(text)
+        except Exception as exc:
+            return False, f"改完的 TOML 解析失败（{exc}），已放弃写入，请用 WebUI 改"
+
+        for dotted, parsed_value in expected.items():
+            section, _, key = dotted.partition(".")
+            if (parsed.get(section) or {}).get(key, _MISSING) != parsed_value:
+                return False, f"改完校验不一致（{dotted}），已放弃写入，请用 WebUI 改"
+
+        try:
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(text, encoding="utf-8", newline="\n")
             os.replace(tmp, path)
@@ -2753,26 +2802,108 @@ class BirthdayPlugin(MaiBotPlugin):
         return True, str(path)
 
     @staticmethod
-    def _set_toml_value(text: str, key: str, value: str, section: str) -> str:
-        """替换 ``key = ...`` 那一行；没有这个键就插到 ``[section]`` 标题后面。"""
+    def _toml_literal(value: str) -> Any:
+        """按 TOML 解析一个值字面量；不合法时返回哨兵 ``_INVALID``。"""
 
-        replaced, count = re.subn(
-            rf"(?m)^{re.escape(key)}\s*=\s*.*$",
-            lambda match: f"{key} = {value}",
-            text,
-            count=1,
-        )
-        if count:
-            return replaced
-        inserted, count = re.subn(
-            rf"(?m)^\[{re.escape(section)}\]\s*$",
-            lambda match: f"{match.group(0)}\n{key} = {value}",
-            text,
-            count=1,
-        )
-        if count:
-            return inserted
-        return text.rstrip("\n") + f"\n\n[{section}]\n{key} = {value}\n"
+        try:
+            return tomllib.loads(f"v = {value}")["v"]
+        except Exception:
+            return _INVALID
+
+    @classmethod
+    def _patch_toml(cls, text: str, key: str, value: str, section: str) -> str:
+        """把 ``[section]`` 里的 ``key`` 换成 ``value``（值已确认是合法 TOML 字面量）。
+
+        三处细节都按"用户手改过配置"来写：
+
+        - section 标题允许 ``[ greeting ]`` 这种带空格写法（TOML 合法，但老版本的正则会漏）；
+        - 值可能是跨行数组（``announce_groups = [`` 换行写），替换必须吃掉整段，
+          否则残留的 ``"123",`` 和 ``]`` 会变成语法错误；
+        - 只有真的没有这个 section 时，才在文件末尾补一个。
+        """
+
+        key_re = re.compile(rf"^(\s*){re.escape(key)}\s*=")
+        lines = text.splitlines(keepends=True)
+
+        offsets: list[int] = []
+        position = 0
+        for line in lines:
+            offsets.append(position)
+            position += len(line)
+
+        header_index: int | None = None
+        for index, line in enumerate(lines):
+            match = _SECTION_HEADER_RE.match(line.rstrip("\n"))
+            if not match:
+                continue
+            if header_index is not None:
+                break
+            if match.group(1).strip() == section:
+                header_index = index
+
+        if header_index is None:
+            return text.rstrip("\n") + f"\n\n[{section}]\n{key} = {value}\n"
+
+        end_index = len(lines)
+        for index in range(header_index + 1, len(lines)):
+            if _SECTION_HEADER_RE.match(lines[index].rstrip("\n")):
+                end_index = index
+                break
+
+        for index in range(header_index + 1, end_index):
+            match = key_re.match(lines[index])
+            if not match:
+                continue
+            value_start = offsets[index] + match.end()
+            value_end = cls._toml_value_end(text, value_start)
+            return text[:value_start] + " " + value + text[value_end:]
+
+        insert_at = offsets[header_index] + len(lines[header_index])
+        return text[:insert_at] + f"{key} = {value}\n" + text[insert_at:]
+
+    @staticmethod
+    def _toml_value_end(text: str, start: int) -> int:
+        """从值的开头扫到值的结尾（跨行数组也扫得对），顺手吃掉行尾空格与注释。"""
+
+        index = start
+        depth = 0
+        quote = ""
+        while index < len(text):
+            char = text[index]
+            if quote:
+                if char == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = ""
+                index += 1
+                continue
+            if char in "\"'":
+                quote = char
+                index += 1
+                continue
+            if char == "#":
+                while index < len(text) and text[index] != "\n":
+                    index += 1
+                continue
+            if char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                index += 1
+                if depth <= 0:
+                    break
+                continue
+            elif char == "\n" and depth <= 0:
+                break
+            index += 1
+
+        while index < len(text) and text[index] in " \t":
+            index += 1
+        if index < len(text) and text[index] == "#":
+            while index < len(text) and text[index] != "\n":
+                index += 1
+        return index
 
     def _delete_cached(self, raw: str) -> str:
         """``/birth del <QQ号>``：精确删掉这个 QQ 的缓存记录（不做模糊匹配）。"""

@@ -93,8 +93,11 @@ Hook 只在麦麦本来就要回复时触发。
 `prompt.prompt_template`：注入文本，占位符 `{names}` 寿星列表、`{count}` 人数、`{upcoming}` 未来几天即将过生日的人。
 想回到更保守的「合适才提」语气，就换成：`【生日提醒】今天是 {names} 的生日。如果当前对话里自然合适，可以顺口祝一句生日快乐；如果不合适或在聊别的事，就正常聊，不要硬提。`
 
-`access.admin_user_ids`：允许执行写操作指令（`recheck` / `group` / `custom` / `del`）的 QQ 号。本机操作者始终允许，
-留空表示只有本机操作者能改数据。
+`access.admin_user_ids`：允许执行写操作指令（`recheck` / `group` / `custom` / `del` / 指定对象的 `test`）的 QQ 号。
+本机操作者始终允许，留空表示只有本机操作者能改数据。
+
+`access.list_visible_to_all`：`/birth list` 是否对所有人开放，默认 `true`。开着时群里谁都能看到全部缓存
+（昵称 + QQ 号 + 月日）；介意的话关掉，只有管理员能看全量列表。
 
 群号和 QQ 号都填数字本身：
 
@@ -105,7 +108,12 @@ announce_groups = ["123456789"]
 
 [access]
 admin_user_ids = ["10001"]
+list_visible_to_all = true
 ```
+
+`/birth group` 会改插件目录下的 `config.toml`（Host 没有"写配置"的能力，只能改文件）。改动是定点替换：
+先确认现有文件能解析、改完再用 `tomllib` 校验一遍（连"目标键确实变成了期望的值"一起查），
+任何一步不成立就原样放弃并提示去 WebUI 改——不会给 Runner 留一个解不开的配置。
 
 ## 手动命令
 
@@ -151,6 +159,7 @@ admin_user_ids = ["10001"]
 指令的回复由插件自己发（`ctx.send.text`）：宿主只把命令返回值写进日志，不会替插件发消息。
 
 `recheck` / `group` / `custom` / `del` 需要 `access.admin_user_ids` 里的账号或本机操作者，其他人发了只会看到提示。
+`list` 默认所有人可用，关掉 `access.list_visible_to_all` 后同样需要管理员。
 `test` 不带参数时人人可用（只能测自己），带 QQ 号才算写操作，同样要管理员。
 
 ## 注意事项

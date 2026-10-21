@@ -22,30 +22,25 @@
 
 from __future__ import annotations
 
-from __future__ import annotations
-
-import logging
-from typing import Any, Literal
-from maibot_sdk import Field, PluginConfigBase
-from pydantic import field_validator, model_validator
-import re
-import tomllib
-from datetime import date
-from typing import Any, Iterable
+import asyncio
 import json
+import logging
 import os
+import re
 import time
+import tomllib
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
-import asyncio
-from datetime import date, datetime
+from typing import Any, Iterable, Literal
+
 from maibot_sdk import (
     API,
     CONFIG_RELOAD_SCOPE_SELF,
     Command,
+    Field,
     HookHandler,
     MaiBotPlugin,
+    PluginConfigBase,
     Tool,
 )
 from maibot_sdk.types import (
@@ -55,6 +50,7 @@ from maibot_sdk.types import (
     ToolParameterInfo,
     ToolParamType,
 )
+from pydantic import field_validator, model_validator
 
 
 # ============================================================================
@@ -136,11 +132,12 @@ class PluginSection(PluginConfigBase):
             "读取生日依赖 NapCat 特有的 birthday_year/month/day 字段，"
             "SnowLuma 适配器没有这些字段；两个兼容适配器同时启用时短名不唯一、"
             "Host 会拒绝调用，因此默认填 NapCat 适配器的全名。"
-            "留空则按短名调用，由 Host 自动定位唯一提供方"
+            "全名找不到提供方时会自动退回短名（例如只装了 SnowLuma 之类兼容实现），"
+            "并把好用的形态记到下次；留空则直接用短名"
         ),
         json_schema_extra={
             "label": "适配器插件 ID",
-            "hint": "默认 NapCat 适配器；留空则按短名自动定位（同时启用两个适配器时会失败）",
+            "hint": "默认 NapCat 适配器；全名不通会自动退回短名",
             "placeholder": DEFAULT_ADAPTER_PLUGIN_ID,
         },
     )
@@ -1023,10 +1020,8 @@ class NapCatBirthdaySource:
 
     async def _call(self, short_name: str, **kwargs: Any) -> Any:
         api = self.api_name(short_name)
-        try:
-            raw = await self._plugin.ctx.api.call(api, **kwargs)
-        except Exception as exc:
-            self._logger.warning("调用 %s 失败: %s", api, exc)
+        raw = await self._plugin.call_adapter_api(short_name, **kwargs)
+        if raw is None:
             return None
         return self._unwrap(api, raw)
 
@@ -1821,9 +1816,9 @@ class BirthdayScheduler:
             segments.append({"type": "text", "data": {"text": text}})
 
         try:
-            api = self._plugin.adapter_api_name("adapter.napcat.group.send_group_msg")
-            result = await self._plugin.ctx.api.call(
-                api, params={"group_id": str(group_id), "message": segments}
+            result = await self._plugin.call_adapter_api(
+                "adapter.napcat.group.send_group_msg",
+                params={"group_id": str(group_id), "message": segments},
             )
             if _api_ok(result):
                 return True
@@ -1867,9 +1862,8 @@ class BirthdayScheduler:
         """
 
         try:
-            api = self._plugin.adapter_api_name("adapter.napcat.message.send_private_msg")
-            result = await self._plugin.ctx.api.call(
-                api,
+            result = await self._plugin.call_adapter_api(
+                "adapter.napcat.message.send_private_msg",
                 params={
                     "user_id": str(user_id),
                     "group_id": str(group_id),
@@ -2067,6 +2061,8 @@ class BirthdayPlugin(MaiBotPlugin):
         self._collector: BirthdayCollector | None = None
         self._scheduler: BirthdayScheduler | None = None
         self._ready = False
+        # 记住"全名/短名"哪种调得通（空串 = 还没试过），见 call_adapter_api
+        self._api_style = ""
 
     # ==================== 生命周期 ====================
 
@@ -2124,6 +2120,8 @@ class BirthdayPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             self.ctx.logger.debug("忽略非本插件范围的配置更新: %s", scope)
             return
+        # 换了适配器（adapter_plugin_id）就重新探一次全名/短名
+        self._api_style = ""
         self.ctx.logger.info(
             "麦麦祝你生日快乐呀配置已更新(version=%s)：道贺 %s，文案 %s，采集间隔 %s 小时",
             version,
@@ -2150,7 +2148,7 @@ class BirthdayPlugin(MaiBotPlugin):
     # ==================== 适配器 API 名解析 ====================
 
     def adapter_api_name(self, short_name: str) -> str:
-        """解析适配器 API 调用名。
+        """解析适配器 API 调用名（首选形态）。
 
         配置了 ``plugin.adapter_plugin_id`` 时拼成 ``<插件ID>.<短名>`` 全名：
         Host 按短名解析时若同时存在 NapCat 与 SnowLuma 两个提供方，会直接报
@@ -2159,6 +2157,61 @@ class BirthdayPlugin(MaiBotPlugin):
 
         provider = self.config.plugin.adapter_plugin_id
         return f"{provider}.{short_name}" if provider else short_name
+
+    def adapter_api_names(self, short_name: str) -> list[str]:
+        """候选调用名：全名优先，短名兜底。
+
+        真实环境里常见"配的是 NapCat、实际加载的是 SnowLuma 之类的兼容适配器"
+        （SnowLuma 也注册了 ``adapter.napcat.*`` 这组名字）。全名找不到提供方时
+        退回短名，Host 会挑唯一的提供方，就不必逼用户去改 ``adapter_plugin_id``。
+        """
+
+        provider = self.config.plugin.adapter_plugin_id
+        if not provider or short_name.startswith(f"{provider}."):
+            return [short_name]
+        return [f"{provider}.{short_name}", short_name]
+
+    @staticmethod
+    def _missing_provider(raw: Any) -> bool:
+        """这次调用是不是"根本没有这个 API 提供方"（而不是业务上的失败）。"""
+
+        if not isinstance(raw, dict) or raw.get("success") is not False:
+            return False
+        error = str(raw.get("error") or raw.get("message") or "")
+        return ("提供方" in error and "未找到" in error) or "provider not found" in error.lower()
+
+    async def call_adapter_api(self, short_name: str, **kwargs: Any) -> Any:
+        """调一次适配器 API：全名不通就换短名，并记住哪种形态好用。"""
+
+        names = self.adapter_api_names(short_name)
+        if len(names) > 1 and getattr(self, "_api_style", "") == "short":
+            names = list(reversed(names))
+        full_name = self.adapter_api_name(short_name)
+        last_error = ""
+        for name in names:
+            try:
+                raw = await self.ctx.api.call(name, **kwargs)
+            except Exception as exc:
+                last_error = f"{name}: {exc}"
+                self.ctx.logger.debug("调用 %s 失败: %s", name, exc)
+                continue
+            if self._missing_provider(raw):
+                last_error = f"{name}: {raw.get('error') if isinstance(raw, dict) else raw}"
+                self.ctx.logger.debug("调用 %s 找不到提供方，换下一个名字", name)
+                continue
+            style = "full" if name == full_name else "short"
+            if style != getattr(self, "_api_style", "") and len(names) > 1:
+                self._api_style = style
+                if style == "short":
+                    self.ctx.logger.info(
+                        "适配器全名 %s 找不到提供方，改用短名 %s（当前实际生效的可能是兼容适配器）",
+                        full_name,
+                        name,
+                    )
+            return raw
+        if last_error:
+            self.ctx.logger.warning("适配器 API 调用失败（%s）: %s", short_name, last_error)
+        return None
 
     # ==================== Hook：注入回复上下文 ====================
 
@@ -2296,6 +2349,13 @@ class BirthdayPlugin(MaiBotPlugin):
         （"命令处理完成，跳过后续消息处理: ..."），Host 自己的内置命令也都是自己调
         ``text_to_stream`` 发的（例如权限不足时先发"你没有权限使用此命令。"，
         再 ``return True, "没有权限", False``）。所以这里必须自己 ``send.text``。
+
+        真机验证（MaiBot 1.3.0，2026-10-21 19:05:57 的一次 /birth test）：
+        日志里只有"消息发送服务"的一条回复（插件自己发的），紧接着是
+        ``命令执行成功: birthday (拦截等级: 1)`` 和 ``命令处理完成: <文本>``，
+        之后没有任何发送记录——也就是说返回的文本确实只进了日志。
+        全仓 ``cmd_result`` 也只有 6 处引用，全是日志/流程判断，没有一处发送。
+        第三项按 ``component_query.py`` 的 ``intercept = bool(result[2])`` 当布尔用是对的。
         """
 
         if self._store is None:
@@ -2303,8 +2363,9 @@ class BirthdayPlugin(MaiBotPlugin):
 
         success, reply, intercept = await self._birthday_command_reply(kwargs)
         await self._send_command_reply(reply, str(kwargs.get("stream_id") or ""))
-        # 返回文本照旧带回去：留给日志和 chat.command.after_execute hook 看。
-        # 万一将来 Host 改成自动发送这段文本，用户会收到两条——届时把返回值换成 "" 即可。
+        # 返回文本照旧带回去，只用来给日志和 chat.command.after_execute hook 看。
+        # 已在真机上确认当前 Host 不会替插件发送这段文本（详见 docstring 里的日志证据），
+        # 所以不会出现两条回复；将来若某版本真按文档自动发送，把这里换成 "" 即可。
         return success, reply, intercept
 
     async def _send_command_reply(self, reply: str, stream_id: str) -> None:
@@ -2792,6 +2853,15 @@ class BirthdayPlugin(MaiBotPlugin):
             section, _, key = dotted.partition(".")
             if (parsed.get(section) or {}).get(key, _MISSING) != parsed_value:
                 return False, f"改完校验不一致（{dotted}），已放弃写入，请用 WebUI 改"
+
+        # 和宿主抢同一个文件：WebUI 存盘、Runner 重写配置都可能在上面几步之间落地，
+        # 谁后写谁赢会悄悄丢掉对方的改动。落盘前再读一次，内容变了就整笔放弃（让用户重试）。
+        try:
+            current = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        if current != original:
+            return False, "配置刚被别处改过（WebUI / Runner 正在写），本次没有写入，请重试"
 
         try:
             tmp = path.with_name(path.name + ".tmp")

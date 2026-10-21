@@ -2469,7 +2469,7 @@ class BirthdayPlugin(MaiBotPlugin):
         person["key"] = target
         person["user_id"] = target
         if not str(person.get("name") or "").strip():
-            person["name"] = target
+            person["name"] = await self._name_for_test(target, kwargs)
 
         text = "【测试】" + await self._scheduler.compose_greeting(person)
         try:
@@ -2488,6 +2488,35 @@ class BirthdayPlugin(MaiBotPlugin):
 
         self.ctx.logger.info("[测试] 已向 %s 发送测试祝福（%s）：%s", target, where, text)
         return f"已发送到{where}（未记入道贺记录）：\n{text}"
+
+    async def _name_for_test(self, qq: str, kwargs: dict[str, Any]) -> str:
+        """测试祝福要写进文案里，所以名字得先弄对：本次消息的群名片/昵称 → 名片接口 → QQ 号。
+
+        自己测自己时直接用手上这条消息里的群名片/昵称，不额外打接口；
+        测别人（或消息里拿不到名字）时才读一次名片，读不到就退回 QQ 号。
+        """
+
+        if qq == str(kwargs.get("user_id") or "").strip():
+            message = kwargs.get("message")
+            info = message.get("message_info") if isinstance(message, dict) else None
+            user = info.get("user_info") if isinstance(info, dict) else None
+            if isinstance(user, dict):
+                for field in ("user_cardname", "user_nickname"):
+                    value = str(user.get(field) or "").strip()
+                    if value:
+                        return value
+
+        if self._source is not None:
+            try:
+                profile = await self._source.fetch_stranger(qq, no_cache=True)
+            except Exception as exc:
+                self.ctx.logger.debug("测试祝福读名片失败(%s): %s", qq, exc)
+                profile = None
+            if profile:
+                name = pick_name(profile)
+                if name:
+                    return name
+        return qq
 
     async def _recheck(self) -> str:
         """``/birth recheck``：立刻重新读取一次生日（好友 + 白名单群成员）。"""

@@ -13,7 +13,7 @@
 对外暴露的三个入口：
 
 1. ``maisaka.replyer.before_request`` Hook —— 把"今天谁过生日"注入本次回复要求，
-   由麦麦在**本次回复里用自己的话**说（Hook 只在麦麦本来就要回复时触发）。
+   由麦麦在**本次回复里用自己的话**说。
 2. ``birthday_query`` Tool —— 让麦麦在被问到"谁快过生日了"时能自己查。
 3. ``/birth`` 指令（``/生日`` 同样可用）—— help / list / recheck / group / custom / del。
 
@@ -64,16 +64,20 @@ _logger = logging.getLogger(__name__)
 CONFIG_SCHEMA_VERSION = "1.0.0"
 
 
-# 默认绑定的适配器插件 ID。
+# 已知提供了 ``adapter.napcat.*`` 这组 API 的适配器插件 ID（按优先级）。
 #
-# 本插件读取的是名片里的 birthday_year / birthday_month / birthday_day 三个字段。
-# 同时启用 NapCat 与 SnowLuma 两个兼容适配器时，Host 按短名（``adapter.napcat.*``）
-# 解析会遇到多个提供方并直接拒绝调用；写成全名走 Host 的精确匹配分支。
+# 本插件只用到名片里的 birthday_year / birthday_month / birthday_day 三个字段，
+# 以及收发消息、拉好友/群/成员列表这些 OneBot 通用动作，所以"用哪个适配器"只是前缀不同。
+# 注意：生日字段目前只有 NapCat 会返回，别的兼容实现采集时会一直命中 0 人。
 #
-# 但"配哪个"不该由用户操心：``call_adapter_api`` 会先试全名，遇到"找不到提供方"
-# 就退回短名（SnowLuma 也注册了 ``adapter.napcat.*`` 这组名字），并记住好用的那种。
-# 实测（2026-10-21，NapCat 未激活、SnowLuma 生效）：采集正常，
-# 好友 24 条命中 1 人、群 2 个、成员检查 36 人、失败 0 次。
+# 这里列的是自动探测顺序，最后退到不带前缀的短名。
+# 谁真正提供 API 就用谁，第一次成功后会记住（``_adapter_used``），不再重试。
+ADAPTER_PLUGIN_CANDIDATES: tuple[str, ...] = (
+    "maibot-team.napcat-adapter",
+    "maibot-team.snowluma-adapter",
+)
+
+# 配置里的首选适配器：默认 NapCat 全名；留空则按 ADAPTER_PLUGIN_CANDIDATES 自动探测
 DEFAULT_ADAPTER_PLUGIN_ID = "maibot-team.napcat-adapter"
 
 ANNOUNCE_MODES: tuple[str, ...] = ("off", "prompt_only", "group", "private", "both")
@@ -129,16 +133,14 @@ class PluginSection(PluginConfigBase):
     adapter_plugin_id: str = Field(
         default=DEFAULT_ADAPTER_PLUGIN_ID,
         description=(
-            "提供 adapter.napcat.* API 的适配器插件 ID。"
-            "读取生日依赖名片里的 birthday_year/month/day 字段；"
-            "两个兼容适配器同时启用时短名不唯一、Host 会拒绝调用，因此默认填 NapCat 适配器的全名。"
-            "全名找不到提供方时会自动退回短名（例如实际生效的是 SnowLuma 之类兼容实现），"
-            "并把好用的形态记到下次；留空则直接用短名"
+            "提供 adapter.napcat.* 的适配器插件 ID，默认 maibot-team.napcat-adapter。"
+            "同时启用两个兼容适配器时短名不唯一、宿主会拒绝调用，必须写全名；"
+            "留空则按 NapCat → 短名 的顺序自动探测"
         ),
         json_schema_extra={
             "label": "适配器插件 ID",
-            "hint": "默认 NapCat 适配器；全名不通会自动退回短名",
-            "placeholder": DEFAULT_ADAPTER_PLUGIN_ID,
+            "hint": "默认 NapCat 适配器；留空则自动探测",
+            "placeholder": "maibot-team.napcat-adapter",
         },
     )
 
@@ -164,13 +166,13 @@ class SourceSection(PluginConfigBase):
     include_group_members: bool = Field(
         default=False,
         description=(
-            "[谨慎] 是否采集群成员生日。「群聊道贺」要靠它才知道群里有谁、他们的生日是几号。"
+            "是否采集群成员生日。「群聊道贺」要靠它才知道群里有谁、他们的生日是几号。"
             "群成员列表本身不含生日，需要逐个调用 get_stranger_info，"
             "人数多时请求量大、有触发风控的风险，所以带每群上限和总量预算。"
             "注意只采 greeting.announce_groups 白名单里的群，白名单留空时一个群都不采"
         ),
         json_schema_extra={
-            "label": "[谨慎] 采集群成员生日",
+            "label": "采集群成员生日",
             "hint": "逐个查名片，人多时有风控风险；配合下面的每群上限与总量预算使用",
         },
     )
@@ -282,20 +284,19 @@ class GreetingSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "非好友用群临时会话私聊",
-            "hint": "群设置里开了「允许群成员发起临时会话」才发得出去；否则只有群道贺",
+            "hint": "需要群开启「允许群成员发起临时会话」",
         },
     )
     announce_groups: list[str] = Field(
         default_factory=list,
         description=(
             "群白名单：既是采集群成员的范围，也是群道贺的范围。"
-            "**留空 = 一个群都不碰**（不采集、不群发）——空列表就照字面读作「没选群」。"
             "要把「机器人所在的全部群」都算进来，请显式写 [\"*\"]，"
             "这样「扫全部群」永远是一个看得见的决定，而不是空字段的副作用"
         ),
         json_schema_extra={
             "label": "群白名单",
-            "hint": '留空 = 一个群都不碰；填群号 = 只这些群；填 ["*"] = 机器人所在的全部群',
+            "hint": "",
         },
     )
     at_person: bool = Field(
@@ -477,7 +478,7 @@ class PromptSection(PluginConfigBase):
         default=True,
         description=(
             "是否在麦麦生成回复前，把「今天是谁的生日」追加到本次回复要求里。"
-            "只影响提示词、不做任何 IO；注意 Hook 只在麦麦本来就要回复时触发"
+            "只影响提示词、不做任何 IO"
         ),
         json_schema_extra={"label": "注入生日提醒"},
     )
@@ -527,7 +528,7 @@ class PromptSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "注入模板",
-            "hint": "支持 {names} {count} {upcoming}；注意 Hook 只在麦麦本来就要回复时触发",
+            "hint": "支持 {names} {count} {upcoming}",
             "x-widget": "textarea",
         },
     )
@@ -2061,8 +2062,8 @@ class BirthdayPlugin(MaiBotPlugin):
         self._collector: BirthdayCollector | None = None
         self._scheduler: BirthdayScheduler | None = None
         self._ready = False
-        # 记住"全名/短名"哪种调得通（空串 = 还没试过），见 call_adapter_api
-        self._api_style = ""
+        # 记住实际生效的适配器插件 ID（空串 = 还没探测过），见 call_adapter_api
+        self._adapter_used = ""
 
     # ==================== 生命周期 ====================
 
@@ -2090,7 +2091,7 @@ class BirthdayPlugin(MaiBotPlugin):
                 if self.config.greeting.use_llm_polish
                 else "模板原文"
             ),
-            self.config.plugin.adapter_plugin_id or "（短名自动定位）",
+            self.config.plugin.adapter_plugin_id or "自动探测",
             self._store.path,
         )
 
@@ -2120,8 +2121,8 @@ class BirthdayPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             self.ctx.logger.debug("忽略非本插件范围的配置更新: %s", scope)
             return
-        # 换了适配器（adapter_plugin_id）就重新探一次全名/短名
-        self._api_style = ""
+        # 换了适配器（adapter_plugin_id）就重新探测一次
+        self._adapter_used = ""
         self.ctx.logger.info(
             "麦麦祝你生日快乐呀配置已更新(version=%s)：道贺 %s，文案 %s，采集间隔 %s 小时",
             version,
@@ -2148,66 +2149,72 @@ class BirthdayPlugin(MaiBotPlugin):
     # ==================== 适配器 API 名解析 ====================
 
     def adapter_api_name(self, short_name: str) -> str:
-        """解析适配器 API 调用名（首选形态）。
-
-        配置了 ``plugin.adapter_plugin_id`` 时拼成 ``<插件ID>.<短名>`` 全名：
-        Host 按短名解析时若同时存在 NapCat 与 SnowLuma 两个提供方，会直接报
-        "名称不唯一"而不是随便挑一个，全名走精确匹配分支可以绑定到指定适配器。
-        """
+        """解析适配器 API 调用名（首选形态）。"""
 
         provider = self.config.plugin.adapter_plugin_id
         return f"{provider}.{short_name}" if provider else short_name
 
     def adapter_api_names(self, short_name: str) -> list[str]:
-        """候选调用名：全名优先，短名兜底。
+        """候选调用名：配置的适配器 → 已知适配器 → 短名。
 
-        真实环境里常见"配的是 NapCat、实际加载的是 SnowLuma 之类的兼容适配器"
-        （SnowLuma 也注册了 ``adapter.napcat.*`` 这组名字）。全名找不到提供方时
-        退回短名，Host 会挑唯一的提供方，就不必逼用户去改 ``adapter_plugin_id``。
+        兼容适配器注册的也是同一组 ``adapter.napcat.*`` 名字，
+        所以"用哪个适配器"只影响前缀：按下面的顺序逐个试，谁有提供方就用谁。
+        第一次成功之后会记住（``_adapter_used``），后面直接走它，不再白试。
         """
 
-        provider = self.config.plugin.adapter_plugin_id
-        if not provider or short_name.startswith(f"{provider}."):
-            return [short_name]
-        return [f"{provider}.{short_name}", short_name]
+        names: list[str] = []
+        preferred = (getattr(self, "_adapter_used", "") or self.config.plugin.adapter_plugin_id or "").strip()
+        for provider in (preferred, *ADAPTER_PLUGIN_CANDIDATES):
+            provider = str(provider).strip()
+            if not provider:
+                continue
+            name = f"{provider}.{short_name}"
+            if name not in names:
+                names.append(name)
+        if short_name not in names:
+            names.append(short_name)
+        return names
 
     @staticmethod
-    def _missing_provider(raw: Any) -> bool:
-        """这次调用是不是"根本没有这个 API 提供方"（而不是业务上的失败）。"""
+    def _retry_next(raw: Any) -> bool:
+        """这次调用是不是"名字没解析成提供方/解析不唯一"，值得换下一个名字再试。"""
 
         if not isinstance(raw, dict) or raw.get("success") is not False:
             return False
         error = str(raw.get("error") or raw.get("message") or "")
-        return ("提供方" in error and "未找到" in error) or "provider not found" in error.lower()
+        return (
+            "未找到 API 提供方" in error
+            or "API 名称不唯一" in error
+            or "provider not found" in error.lower()
+        )
 
     async def call_adapter_api(self, short_name: str, **kwargs: Any) -> Any:
-        """调一次适配器 API：全名不通就换短名，并记住哪种形态好用。"""
+        """按候选顺序调一次适配器 API，并把真正生效的适配器记下来。"""
 
-        names = self.adapter_api_names(short_name)
-        if len(names) > 1 and getattr(self, "_api_style", "") == "short":
-            names = list(reversed(names))
-        full_name = self.adapter_api_name(short_name)
         last_error = ""
-        for name in names:
+        for name in self.adapter_api_names(short_name):
             try:
                 raw = await self.ctx.api.call(name, **kwargs)
             except Exception as exc:
                 last_error = f"{name}: {exc}"
                 self.ctx.logger.debug("调用 %s 失败: %s", name, exc)
                 continue
-            if self._missing_provider(raw):
+            if self._retry_next(raw):
                 last_error = f"{name}: {raw.get('error') if isinstance(raw, dict) else raw}"
-                self.ctx.logger.debug("调用 %s 找不到提供方，换下一个名字", name)
+                self.ctx.logger.debug("调用 %s 没解析到提供方，换下一个名字", name)
                 continue
-            style = "full" if name == full_name else "short"
-            if style != getattr(self, "_api_style", "") and len(names) > 1:
-                self._api_style = style
-                if style == "short":
+            provider = name[: -len(short_name) - 1] if name.endswith(f".{short_name}") else ""
+            if provider and provider != getattr(self, "_adapter_used", ""):
+                self._adapter_used = provider
+                configured = str(self.config.plugin.adapter_plugin_id or "").strip()
+                if provider != configured:
                     self.ctx.logger.info(
-                        "适配器全名 %s 找不到提供方，改用短名 %s（当前实际生效的可能是兼容适配器）",
-                        full_name,
-                        name,
+                        "适配器 API 实际走 %s（配置里是 %s），已记住，后续直接用",
+                        provider,
+                        configured or "未指定",
                     )
+                else:
+                    self.ctx.logger.debug("适配器 API 走 %s", provider)
             return raw
         if last_error:
             self.ctx.logger.warning("适配器 API 调用失败（%s）: %s", short_name, last_error)

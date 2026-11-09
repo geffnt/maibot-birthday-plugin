@@ -158,7 +158,7 @@ list_visible_to_all = true
 
 ## 注意事项
 
-本版本要求 MaiBot 1.3.x（1.3.0~1.3.99）与 maibot-plugin-sdk 2.x（2.5.0~2.99.99）。换到更高或更低的宿主/SDK 上可能被判为
+本版本要求 MaiBot 1.3.x～1.4.x（1.3.0~1.4.99）与 maibot-plugin-sdk 2.x（2.5.0~2.99.99）。换到更高或更低的宿主/SDK 上可能被判为
 不兼容，遇到这种情况提个 Issue 说明你的版本。
 
 从插件市场搜「麦麦祝你生日快乐呀」安装即可，也可以把文件夹放进 MaiBot 根目录的 plugins/ 后重启 MaiBot。

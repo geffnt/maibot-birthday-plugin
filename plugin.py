@@ -1,4 +1,4 @@
-"""麦麦祝你生日快乐呀：采集好友 / 群成员的生日，寿星当天主动道贺，并把「今天谁过生日」注入麦麦的回复上下文。
+"""麦麦祝你生日快乐呀：采集好友 / 群成员的生日，寿星当天主动在群里 @ 他并道贺。
 
 单文件插件（标准布局：plugin.py + _manifest.json + README.md + LICENSE），按顺序分七段：
 
@@ -8,14 +8,12 @@
 4. **NapCat 采集** —— 从名片读 birthday_year / birthday_month / birthday_day
 5. **采集器** —— 好友与群成员合并去重
 6. **调度与道贺** —— 定时采集、寿星当天在群里 @ 或私聊道贺
-7. **插件主体** —— 生命周期、把能力暴露给麦麦（Hook / Tool / Command / API）
+7. **插件主体** —— 生命周期、把能力暴露给麦麦（Tool / Command / API）
 
-对外暴露的三个入口：
+对外暴露的两个入口：
 
-1. ``maisaka.replyer.before_request`` Hook —— 把"今天谁过生日"注入本次回复要求，
-   由麦麦在**本次回复里用自己的话**说。
-2. ``birthday_query`` Tool —— 让麦麦在被问到"谁快过生日了"时能自己查。
-3. ``/birth`` 指令（``/生日`` 同样可用）—— help / list / recheck / group / custom / del。
+1. ``birthday_query`` Tool —— 让麦麦在被问到"谁快过生日了"时能自己查。
+2. ``/birth`` 指令（``/生日`` 同样可用）—— help / list / recheck / group / custom / del。
 
 分工原则：**"发不发"由插件决定（确定性），"怎么说"交给模型**。
 """
@@ -38,15 +36,11 @@ from maibot_sdk import (
     CONFIG_RELOAD_SCOPE_SELF,
     Command,
     Field,
-    HookHandler,
     MaiBotPlugin,
     PluginConfigBase,
     Tool,
 )
 from maibot_sdk.types import (
-    ErrorPolicy,
-    HookMode,
-    HookOrder,
     ToolParameterInfo,
     ToolParamType,
 )
@@ -61,7 +55,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.0.0"
+CONFIG_SCHEMA_VERSION = "1.1.0"
 
 
 # 已知提供了 ``adapter.napcat.*`` 这组 API 的适配器插件 ID（按优先级）。
@@ -256,7 +250,7 @@ class GreetingSection(PluginConfigBase):
     __ui_label__ = "生日道贺"
 
     greet_in_group: bool = Field(
-        default=False,
+        default=True,
         description=(
             "群聊道贺开关：开启后在寿星所在的群里 @ 他并祝贺。"
             "寿星范围来自群成员采集（source.include_group_members），"
@@ -447,93 +441,6 @@ class GreetingSection(PluginConfigBase):
             )
         return "replyer"
 
-    @model_validator(mode="after")
-    def _warn_announce(self) -> "GreetingSection":
-        if self.greet_in_group and not self.announce_groups:
-            _logger.warning(
-                "greeting.greet_in_group 已开启，但 greeting.announce_groups 为空："
-                "白名单为空 = 一个群都不碰，群道贺不会发生。"
-                '请填具体群号，或填 ["*"] 表示机器人所在的全部群'
-            )
-        if "*" in self.announce_groups:
-            _logger.info(
-                'greeting.announce_groups 含 "*"：将对机器人所在的全部群采集与道贺'
-            )
-        if self.hour_end <= self.hour_start:
-            _logger.warning(
-                "greeting.hour_end(%s) 不大于 greeting.hour_start(%s)，"
-                "道贺时间窗为空，当天不会主动道贺",
-                self.hour_end,
-                self.hour_start,
-            )
-        return self
-
-
-class PromptSection(PluginConfigBase):
-    """回复上下文注入（maisaka.replyer.before_request）。"""
-
-    __ui_label__ = "上下文注入"
-
-    inject_prompt: bool = Field(
-        default=True,
-        description=(
-            "是否在麦麦生成回复前，把「今天是谁的生日」追加到本次回复要求里。"
-            "只影响提示词、不做任何 IO"
-        ),
-        json_schema_extra={"label": "注入生日提醒"},
-    )
-    skip_greeted: bool = Field(
-        default=True,
-        description=(
-            "已经主动道贺过的人，当天不再注入。默认开启——避免"
-            "「插件先主动发了一条祝福，麦麦聊天时又被提醒再提一次」的重复。"
-            "注意只有**真正送达**才会被记为已道贺：主动发送失败时注入照常发生，"
-            "相当于兜底。道贺方式为 off/prompt_only 时无人被标记，此项无效果"
-        ),
-        json_schema_extra={
-            "label": "已道贺后不再注入",
-            "hint": "主动道贺一次之后，当天的回复上下文里就不再出现这个人",
-        },
-    )
-    max_names: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="一次最多列几个寿星名字。同一天过生日的人多时，只列前几个，避免提示词失控",
-        json_schema_extra={"label": "最多列几个名字"},
-    )
-    include_upcoming_days: int = Field(
-        default=0,
-        ge=0,
-        le=7,
-        description=(
-            "提前几天开始提醒（0=只在当天提醒）。例如填 1，"
-            "生日前一天也会注入「X 明天生日」，方便麦麦提前准备"
-        ),
-        json_schema_extra={"label": "提前提醒天数"},
-    )
-    prompt_template: str = Field(
-        default=(
-            "【生日提醒】今天是 {names} 的生日。"
-            "请在你这次回复里用自己的话顺带送上一句生日祝福，语气自然、别太正式，"
-            "一句就够，不用单独再发一条；如果你这轮本来不适合说话，就不用勉强。"
-        ),
-        description=(
-            "注入到回复要求里的文本模板，「文案怎么说」同样交给麦麦的回复模型。"
-            "可用占位符：{names}=寿星列表（含昵称，可能多个）、{count}=人数、"
-            "{upcoming}=未来几天即将过生日的人（可能为空）。"
-            "想回到更保守的「合适才提」语气，把默认文本换成："
-            "【生日提醒】今天是 {names} 的生日。如果当前对话里自然合适，可以顺口祝一句生日快乐；"
-            "如果不合适或在聊别的事，就正常聊，不要硬提。"
-        ),
-        json_schema_extra={
-            "label": "注入模板",
-            "hint": "支持 {names} {count} {upcoming}",
-            "x-widget": "textarea",
-        },
-    )
-
-
 class AccessSection(PluginConfigBase):
     """指令权限。"""
 
@@ -569,7 +476,6 @@ class BirthdayConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     source: SourceSection = Field(default_factory=SourceSection)
     greeting: GreetingSection = Field(default_factory=GreetingSection)
-    prompt: PromptSection = Field(default_factory=PromptSection)
     access: AccessSection = Field(default_factory=AccessSection)
 
 
@@ -683,26 +589,6 @@ def join_names(people: Iterable[dict[str, Any]], limit: int) -> str:
         return "、".join(names)
     head = "、".join(names[:limit])
     return f"{head} 等 {len(names)} 人"
-
-
-def render_prompt(
-    template: str,
-    people: Iterable[dict[str, Any]],
-    *,
-    max_names: int,
-    upcoming_text: str = "",
-) -> str:
-    """渲染注入到回复要求里的生日提醒。"""
-
-    people_list = list(people)
-    return safe_format(
-        template,
-        {
-            "names": join_names(people_list, max_names),
-            "count": len(people_list),
-            "upcoming": upcoming_text,
-        },
-    ).strip()
 
 
 # ============================================================================
@@ -874,6 +760,19 @@ class BirthdayStore:
         person["groups"] = sorted(groups)
         return True
 
+    def drop_group_membership(self, key: str, group_id: str) -> bool:
+        """把某群从某人的归属里删掉（复核发现他已经不在群里时用）。"""
+
+        person = self._data["people"].get(key)
+        if not isinstance(person, dict):
+            return False
+        groups = set(person.get("groups") or [])
+        if group_id not in groups:
+            return False
+        groups.discard(group_id)
+        person["groups"] = sorted(groups)
+        return True
+
     def remove_keys(self, keys: Iterable[str]) -> int:
         removed = 0
         for key in keys:
@@ -960,7 +859,6 @@ class BirthdayStore:
         for key in stale:
             greeted.pop(key, None)
         return len(stale)
-
 
 def _valid_person(person: dict[str, Any]) -> bool:
     month = person.get("month")
@@ -1527,6 +1425,8 @@ class BirthdayScheduler:
         self._refresh_lock = asyncio.Lock()
         self._retry_backoff_seconds = 0
         self._next_attempt_at = 0.0
+        # /birth recheck 丢到后台的采集任务（持有引用，避免被 GC 掉）
+        self._refresh_task: asyncio.Task | None = None
 
     @property
     def _logger(self) -> Any:
@@ -1577,6 +1477,23 @@ class BirthdayScheduler:
         await self.greet_due()
 
     # ---------- 采集 ----------
+
+    def start_background_refresh(self) -> bool:
+        """把强制采集丢到后台跑，立刻返回是否排上了（命令不能阻塞等 60 秒超时）。"""
+
+        if self._refresh_lock.locked():
+            return False
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return False
+
+        async def _run() -> None:
+            try:
+                await self.refresh_if_needed(force=True)
+            except Exception as exc:  # 后台任务不能把异常抛到事件循环里
+                self._logger.warning("后台重新读取失败：%s", exc)
+
+        self._refresh_task = asyncio.create_task(_run(), name="maibot-birthday-recheck")
+        return True
 
     async def refresh_if_needed(self, *, force: bool = False) -> dict[str, Any] | None:
         """到间隔就重新采集；已有采集在跑时直接返回 ``None``。
@@ -1784,6 +1701,12 @@ class BirthdayScheduler:
     # ---------- 投递 ----------
 
     async def _deliver_group(self, person: dict[str, Any], text: str) -> bool:
+        """在他所在的群里道贺，每个群一条。
+
+        发之前逐个复核"他还在不在这个群"：缓存里的群归属来自上次采集，
+        隔了几周人可能早退群了，不复核就会把祝福发到跟他无关的群里。
+        """
+
         targets = self.group_targets(person)
         if not targets:
             self._logger.debug(
@@ -1794,9 +1717,37 @@ class BirthdayScheduler:
             )
             return False
 
+        key = str(person.get("key") or "")
+        user_id = str(person.get("user_id") or "").strip()
+        source = getattr(self._plugin, "_source", None)
         sent = False
+        changed = False
         for group_id in targets:
+            if user_id and source is not None:
+                # 拉一次成员列表来复核：缓存里的群归属可能是几周前采的，
+                # 人早退群了还照发就会在跟他没关系的群里刷祝福。
+                members = await source.fetch_group_members(group_id, no_cache=True)
+                if members is None:
+                    # 列表没拉回来 → 无法确认，这一轮先不发，60 秒后的下一轮再试。
+                    self._logger.info(
+                        "群 %s 成员列表没拉到，这一轮先不给 %s 群道贺", group_id, display_name(person)
+                    )
+                    continue
+                present = any(normalize_user_id(item) == user_id for item in members)
+                if not present:
+                    self._logger.info(
+                        "群 %s 里已经没有 %s（多半是退群了），跳过这个群",
+                        group_id,
+                        display_name(person),
+                    )
+                    if key and self._store is not None:
+                        changed = self._store.drop_group_membership(key, group_id) or changed
+                    continue
+                if key and self._store is not None:
+                    changed = self._store.add_group_membership(key, group_id) or changed
             sent = await self._send_group(group_id, person, text) or sent
+        if changed and self._store is not None:
+            self._store.save()
         return sent
 
     async def _send_group(self, group_id: str, person: dict[str, Any], text: str) -> bool:
@@ -2081,6 +2032,7 @@ class BirthdayPlugin(MaiBotPlugin):
         self._scheduler = BirthdayScheduler(self, self._store, self._collector)
         self._scheduler.start()
         self._ready = True
+        self._log_config_advisory()
 
         self.ctx.logger.info(
             "麦麦祝你生日快乐呀插件已加载：缓存 %d 人，道贺 %s，文案 %s，适配器 %s，数据文件 %s",
@@ -2123,6 +2075,7 @@ class BirthdayPlugin(MaiBotPlugin):
             return
         # 换了适配器（adapter_plugin_id）就重新探测一次
         self._adapter_used = ""
+        self._log_config_advisory()
         self.ctx.logger.info(
             "麦麦祝你生日快乐呀配置已更新(version=%s)：道贺 %s，文案 %s，采集间隔 %s 小时",
             version,
@@ -2135,6 +2088,28 @@ class BirthdayPlugin(MaiBotPlugin):
             self.config.source.refresh_interval_hours,
         )
 
+    def _log_config_advisory(self) -> None:
+        """配置自相矛盾时提示一次（只在加载/热更新时各打一次，别在解析时刷屏）。"""
+
+        greeting = self.config.greeting
+        if greeting.greet_in_group and not greeting.announce_groups:
+            self.ctx.logger.warning(
+                "greeting.greet_in_group 已开启，但 greeting.announce_groups 为空："
+                "白名单为空 = 一个群都不碰，群道贺不会发生。"
+                '请填具体群号，或填 ["*"] 表示机器人所在的全部群'
+            )
+        elif "*" in greeting.announce_groups:
+            self.ctx.logger.info(
+                'greeting.announce_groups 含 "*"：将对机器人所在的全部群采集与道贺'
+            )
+        if greeting.hour_end <= greeting.hour_start:
+            self.ctx.logger.warning(
+                "greeting.hour_end(%s) 不大于 greeting.hour_start(%s)，"
+                "道贺时间窗为空，当天不会主动道贺",
+                greeting.hour_end,
+                greeting.hour_start,
+            )
+
     def _greeting_flags(self) -> str:
         """道贺开关的简短描述，用在日志里。"""
 
@@ -2144,7 +2119,7 @@ class BirthdayPlugin(MaiBotPlugin):
             parts.append("群聊" + ("@寿星" if greeting.at_person else ""))
         if greeting.greet_in_private:
             parts.append("私聊好友")
-        return "+".join(parts) if parts else "仅注入不主动发"
+        return "+".join(parts) if parts else "关（不主动发）"
 
     # ==================== 适配器 API 名解析 ====================
 
@@ -2219,86 +2194,6 @@ class BirthdayPlugin(MaiBotPlugin):
         if last_error:
             self.ctx.logger.warning("适配器 API 调用失败（%s）: %s", short_name, last_error)
         return None
-
-    # ==================== Hook：注入回复上下文 ====================
-
-    @HookHandler(
-        "maisaka.replyer.before_request",
-        name="birthday_prompt_injector",
-        description="在麦麦生成回复前，把今天的寿星信息追加进本次回复要求",
-        mode=HookMode.BLOCKING,
-        order=HookOrder.LATE,
-        error_policy=ErrorPolicy.SKIP,
-    )
-    async def handle_replyer_before_request(self, **kwargs: Any) -> dict[str, Any]:
-        """把生日提醒拼进 ``extra_prompt``。
-
-        只改提示词、不做任何 IO，异常一律吞掉（``error_policy=SKIP`` 兜底），
-        绝不允许因为生日数据的问题影响麦麦正常回消息。
-        """
-
-        if not self._ready:
-            return {"action": "continue", "modified_kwargs": kwargs}
-
-        try:
-            notice = self._build_prompt_notice()
-        except Exception as exc:
-            self.ctx.logger.debug("构建生日提醒失败，跳过注入: %s", exc)
-            return {"action": "continue", "modified_kwargs": kwargs}
-
-        if not notice:
-            return {"action": "continue", "modified_kwargs": kwargs}
-
-        existing = str(kwargs.get("extra_prompt") or "")
-        # 幂等：重试/重生成时 kwargs 里可能已经带上了同一段提醒
-        if notice in existing:
-            return {"action": "continue", "modified_kwargs": kwargs}
-
-        modified = dict(kwargs)
-        modified["extra_prompt"] = f"{existing}\n{notice}" if existing.strip() else notice
-        self.ctx.logger.debug("已注入生日提醒: %s", notice.replace("\n", " / "))
-        return {"action": "continue", "modified_kwargs": modified}
-
-    def _build_prompt_notice(self) -> str:
-        """生成注入文本；没有可说的内容时返回空串。"""
-
-        if self._store is None or not self.config.prompt.inject_prompt:
-            return ""
-
-        prompt_config = self.config.prompt
-        today = date.today()
-        parts: list[str] = []
-
-        people = self._store.people_on(today.month, today.day)
-        if people and prompt_config.skip_greeted:
-            # 主动道贺已经送达的人不再注入：一次道贺就够，避免麦麦当天反复重提。
-            # 没送达（或两个道贺开关都关）的人不会被标记，注入照常发生。
-            people = [
-                person
-                for person in people
-                if not self._store.was_greeted(str(person.get("key") or ""), today)
-            ]
-        if people:
-            parts.append(
-                render_prompt(
-                    prompt_config.prompt_template,
-                    people,
-                    max_names=prompt_config.max_names,
-                )
-            )
-
-        upcoming_days = int(prompt_config.include_upcoming_days)
-        if upcoming_days > 0:
-            upcoming = self._store.upcoming(today, upcoming_days)
-            if upcoming:
-                upcoming_names = "、".join(
-                    f"{display_name(person)}"
-                    f"（{offset} 天后，{format_month_day(person)}）"
-                    for person, offset in upcoming[: prompt_config.max_names]
-                )
-                parts.append(f"【生日预告】{upcoming_names}。")
-
-        return "\n".join(part for part in parts if part).strip()
 
     # ==================== Tool：让麦麦自己查 ====================
 
@@ -2608,23 +2503,19 @@ class BirthdayPlugin(MaiBotPlugin):
         return qq
 
     async def _recheck(self) -> str:
-        """``/birth recheck``：立刻重新读取一次生日（好友 + 白名单群成员）。"""
+        """``/birth recheck``：丢到后台重新读一次，立刻回复。
+
+        采集本身要几分钟（群成员多时几百次查名片），而宿主等指令回复只给 60 秒，
+        在这里同步等就会被判超时、连回复都收不到。
+        """
 
         assert self._scheduler is not None
-        try:
-            stats = await self._scheduler.refresh_if_needed(force=True)
-        except Exception as exc:
-            return f"重新读取失败：{exc}"
-        if stats is None:
-            return "已经有一次采集在进行中，请稍后再试。"
+        if not self._scheduler.start_background_refresh():
+            return "已经有一次采集在进行中，这次就等它跑完吧。"
         return (
-            "✅ 重新读取完成\n"
-            f"好友 {stats.get('friends_total', 0)} 条 / 命中生日 {stats.get('friends_with_birthday', 0)} 人\n"
-            f"群 {stats.get('groups_planned', 0) or stats.get('groups_discovered', 0)} 个 / "
-            f"成员检查 {stats.get('group_members_checked', 0)} 人"
-            f"（实际查名片 {stats.get('strangers_queried', 0)} 次）\n"
-            f"新增或更新 {stats.get('saved', 0)} 条，缓存共 {stats.get('total_cached', 0)} 人，"
-            f"耗时 {stats.get('elapsed_ms', 0)}ms，失败 {stats.get('errors', 0)} 次"
+            "已开始重新读取生日（好友 + 白名单群成员）。\n"
+            "成员多时要几分钟，期间聊天不受影响；跑完缓存自动更新，"
+            "结果也会打印在日志里（“生日采集完成”）。"
         )
 
     def _add_group(self, args: list[str]) -> str:
@@ -2753,7 +2644,7 @@ class BirthdayPlugin(MaiBotPlugin):
             )
         else:
             checked = "、".join(item for item in probed if item not in probe_failed)
-            out.append(f"不在白名单群（{checked}）里：群道贺不会发，只出现在 list 和麦麦的聊天上下文")
+            out.append(f"不在白名单群（{checked}）里：群道贺不会发，只出现在 list 里")
         if friend_flag is False:
             temp_ok = bool(self.config.greeting.private_temp_session)
             if not temp_ok:

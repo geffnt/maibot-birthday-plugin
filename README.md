@@ -1,7 +1,7 @@
 # 麦麦祝你生日快乐呀 (maibot-birthday-plugin)
 
-通过 napcat 读取好友和群成员名片里的生日写入本地缓存，寿星当天在群里 @ 进行祝贺，也能给好友发私聊，
-把「今天是谁的生日」塞进麦麦的回复上下文里。
+通过 napcat 读取好友和群成员名片里的生日写入本地缓存，寿星当天由插件主动在群里 @ 他并发送祝贺，
+好友还能收到一条私聊；不需要麦麦正在聊天，到点自己发。
 snowluma 并没有读取资料卡的生日的功能，所以不支持 snowluma。
 
 ## 功能
@@ -9,7 +9,7 @@ snowluma 并没有读取资料卡的生日的功能，所以不支持 snowluma�
 - 读名片取生日：使用 napcat 的 `get_friend_list` / `get_stranger_info` 获取 `birthday_year` / `birthday_month` / `birthday_day`。
 - 本地缓存：采到的生日存在 `data/plugins/geffnt.maibot-birthday-plugin/birthdays.json`，聊天时不再反复请求接口。
 - 主动道贺：到点在白名单群里 @ 寿星发送祝贺，或给过生日的好友发私聊；非好友可以走群临时会话。
-- 上下文注入：麦麦本来就要回复时，把生日提醒追加进这次回复的要求里，让它自己决定要不要提。
+- 到点主动发：调度器每分钟检查一次，进入时间窗（默认 8:00）后给当天过生日、还没祝贺过的人投递，不依赖麦麦是否在聊天。
 - 工具与指令：麦麦能调 `birthday_query` 工具查谁快过生日，群友能用 `/birth` 系列指令看缓存、重采、登记、删除，`/birth test` 可以发送祝福测试功能。
 - 文案交给模型：默认用 `replyer` 任务现写，模型失败或返回空时回退 `greeting_template`，不会因此漏发。
 - 去重：同一个人同一天只道贺一次，插件重启、热重载都不会重发。
@@ -47,8 +47,9 @@ snowluma 并没有读取资料卡的生日的功能，所以不支持 snowluma�
 `source.drop_missing`：采集成功时是否把本次没出现的人从缓存里删掉，默认关闭。一次不完整的采集（比如适配器半途断开）
 不应该清空已有数据。
 
-`greeting.greet_in_group`：群聊道贺开关，默认关闭。开启后在寿星所在的群里 @ 他并祝贺，寿星范围来自
-`source.include_group_members`，群范围由 `greeting.announce_groups` 决定。
+`greeting.greet_in_group`：群聊道贺开关，默认开启。开启后由插件自己在寿星所在的群里 @ 他并祝贺，寿星范围来自
+`source.include_group_members`，群范围由 `greeting.announce_groups` 决定；群归属来自上次采集，发送前会
+再查一次群成员信息复核，人已经退群就不往那个群发。同一个人当天只发一次，他在几个群就各发一条。
 
 `greeting.greet_in_private`：私聊道贺开关，默认关闭。开启后给过生日的好友单独发一条；和群聊开关互相独立，可以只开一个。
 
@@ -60,7 +61,7 @@ snowluma 并没有读取资料卡的生日的功能，所以不支持 snowluma�
 `greeting.at_person`：群道贺时是否 @ 寿星本人，默认开启；关掉就发普通文本。
 
 `greeting.hour_start` / `greeting.hour_end`：允许道贺的时间窗，默认 8 点到 23 点（本地时间，左闭右开）。
-早于起点不发、到点后当天不再补发，避免凌晨或深夜打扰。
+早于起点不发；进入时间窗后的第一轮调度就发，避免凌晨或深夜打扰。
 
 `greeting.greeting_template`：兜底文案，模型生成失败或关闭生成时发送默认文本。占位符 `{name}` 昵称、`{age}` 岁数
 （名片没有年份时为空）、`{month}`、`{day}`、`{qq}`。
@@ -73,18 +74,6 @@ snowluma 并没有读取资料卡的生日的功能，所以不支持 snowluma�
 `greeting.llm_max_tokens`：生成文案的最大 token 数，默认 10000。
 
 `greeting.llm_temperature`：生成文案的采样温度，默认 1.0。
-
-`prompt.inject_prompt`：是否把「今天是谁的生日」注入麦麦的回复要求，默认开启。只影响提示词、不做任何 IO，
-Hook 在麦麦回复时触发。
-
-`prompt.skip_greeted`：已经主动道贺过的人，当天不再注入，默认开启。
-
-`prompt.max_names`：一次最多列几个寿星名字，默认 5，同一天过生日的人多时只列前几个。
-
-`prompt.include_upcoming_days`：提前几天开始提醒，默认 0（只在当天）。填 1 时生日前一天会注入「明天生日」。
-
-`prompt.prompt_template`：注入文本，占位符 `{names}` 寿星列表、`{count}` 人数、`{upcoming}` 未来几天即将过生日的人。
-想回到更保守的「合适才提」语气，就换成：`【生日提醒】今天是 {names} 的生日。如果当前对话里自然合适，可以顺口祝一句生日快乐；如果不合适或在聊别的事，就正常聊，不要硬提。`
 
 `access.admin_user_ids`：允许执行写操作指令（`recheck` / `group` / `custom` / `del` / 指定对象的 `test`）的 QQ 号。
 本机操作者始终允许，留空表示只有本机操作者能改数据。
